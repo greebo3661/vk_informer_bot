@@ -1,0 +1,10 @@
+services:
+  vacation_bot:
+    build: .
+    container_name: vacation_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    network_mode: host
