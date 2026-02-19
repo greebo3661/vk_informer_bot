@@ -62,6 +62,10 @@ def get_menu_keyboard():
             {"text": "ℹ️ Помощь", "callbackData": "cmd_help", "style": "primary"},
         ],
         [
+            {"text": "📅 Расписание", "callbackData": "cmd_schedule", "style": "primary"},
+            {"text": "🔔 Уведомления", "callbackData": "cmd_notifications", "style": "primary"},
+        ],
+        [
             {"text": "📢 Установить этот чат", "callbackData": "cmd_set_channel", "style": "attention"},
         ]
     ]
@@ -222,7 +226,7 @@ async def on_button_click_async(bot: Bot, event):
 
     try:
         if query_id:
-            bot.answer_callback_query(query_id=query_id)
+            bot.answer_callback_query(query_id=query_id, text="")
     except Exception as e:
         logger.warning(f"answer_callback_query failed: {e}")
 
@@ -230,6 +234,14 @@ async def on_button_click_async(bot: Bot, event):
         send_status(bot, chat_id)
     elif callback_data == 'cmd_help':
         send_help(bot, chat_id)
+    elif callback_data == 'cmd_schedule':
+        send_schedule(bot, chat_id)
+    elif callback_data == 'cmd_notifications':
+        pending_state[chat_id] = "awaiting_threshold"
+        bot.send_text(
+            chat_id=chat_id,
+            text="🔔 Измените срок оповещения об отпуске (в днях):\n\nВведите число (например: 7)"
+        )
     elif callback_data == 'cmd_set_channel':
         set_channel_action(bot, chat_id)
 
@@ -259,6 +271,67 @@ def set_channel_action(bot: Bot, chat_id: str):
     data["settings"]["hr_chat_id"] = chat_id
     save_data(data)
     bot.send_text(chat_id=chat_id, text="✅ Этот чат установлен для уведомлений об отпусках.")
+
+
+def send_schedule(bot: Bot, chat_id: str):
+    """Show the next 5 upcoming notification send dates for this chat."""
+    data = load_data()
+    vacations = data.get("vacations", [])
+    settings = data.get("settings", {})
+    chat_settings = settings.get(chat_id, {})
+    notify_days = chat_settings.get("notify_days")
+
+    if not vacations:
+        bot.send_text(
+            chat_id=chat_id,
+            text="📅 Расписание\n\nДанные об отпусках не загружены.",
+            inline_keyboard_markup=get_menu_keyboard()
+        )
+        return
+
+    if not notify_days:
+        bot.send_text(
+            chat_id=chat_id,
+            text="📅 Расписание\n\nПорог уведомлений не настроен. Загрузите Excel-файл.",
+            inline_keyboard_markup=get_menu_keyboard()
+        )
+        return
+
+    today = datetime.now().date()
+    upcoming = []
+    for v in vacations:
+        try:
+            start_dt = datetime.strptime(v["start_date"], "%Y-%m-%d").date()
+            notify_date = start_dt - timedelta(days=notify_days)
+            if notify_date >= today:
+                upcoming.append((notify_date, start_dt, v["fio"]))
+        except Exception:
+            continue
+
+    upcoming.sort(key=lambda x: x[0])
+    top5 = upcoming[:5]
+
+    if not top5:
+        bot.send_text(
+            chat_id=chat_id,
+            text=(
+                f"📅 Расписание\n\n"
+                f"Ближайших уведомлений нет.\n"
+                f"Все отпуска уже начались или уведомления были отправлены."
+            ),
+            inline_keyboard_markup=get_menu_keyboard()
+        )
+        return
+
+    lines = [f"📅 Расписание уведомлений (за {notify_days} дн.)\n"]
+    for notify_date, start_dt, fio in top5:
+        lines.append(f"• {notify_date.strftime('%d.%m.%Y')} — {fio} (отпуск с {start_dt.strftime('%d.%m.%Y')})")
+
+    bot.send_text(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        inline_keyboard_markup=get_menu_keyboard()
+    )
 
 
 def send_status(bot: Bot, chat_id: str):
@@ -631,8 +704,11 @@ async def send_notifications(bot: Bot):
                 start_dt = datetime.strptime(v["start_date"], "%Y-%m-%d").date()
                 days_left = (start_dt - today).days
 
-                if days_left == notify_days:
-                    key = f"{idx}_{chat_id}"
+                # Notify when days_left <= notify_days and vacation hasn't started yet
+                # Key includes today's date so re-runs on the same day are idempotent
+                # but a missed day (bot was offline) will still trigger on the next run
+                if 0 <= days_left <= notify_days:
+                    key = f"{idx}_{chat_id}_{today}"
                     if key not in notified:
                         msg = (
                             f"⏰ Напоминание об отпуске\n\n"
