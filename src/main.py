@@ -45,7 +45,7 @@ def load_data() -> Dict:
                 return json.load(f)
         except Exception as e:
             logger.warning(f"Failed to load data file: {e}")
-    return {"vacations": [], "settings": {}, "notifications": []}
+    return {"vacations": {}, "settings": {}, "notifications": {}}
 
 
 def save_data(data: Dict):
@@ -276,7 +276,8 @@ def set_channel_action(bot: Bot, chat_id: str):
 def send_schedule(bot: Bot, chat_id: str):
     """Show the next 5 upcoming notification send dates for this chat."""
     data = load_data()
-    vacations = data.get("vacations", [])
+    all_vacations = data.get("vacations", {})
+    vacations = all_vacations.get(chat_id, []) if isinstance(all_vacations, dict) else all_vacations
     settings = data.get("settings", {})
     chat_settings = settings.get(chat_id, {})
     notify_days = chat_settings.get("notify_days")
@@ -336,8 +337,11 @@ def send_schedule(bot: Bot, chat_id: str):
 
 def send_status(bot: Bot, chat_id: str):
     data = load_data()
-    count = len(data.get("vacations", []))
-    hr_chat = data.get("settings", {}).get("hr_chat_id", "не установлен")
+    vacations = data.get("vacations", {})
+    if isinstance(vacations, dict):
+        count = len(vacations.get(chat_id, []))
+    else:
+        count = len(vacations)
     chat_settings = data.get("settings", {}).get(chat_id, {})
     notify_days = chat_settings.get("notify_days", "не задано")
 
@@ -347,7 +351,6 @@ def send_status(bot: Bot, chat_id: str):
             f"📊 Статус бота\n\n"
             f"📅 Записей об отпусках: {count}\n"
             f"⏰ Уведомлять за: {notify_days} дн.\n"
-            f"📢 Канал уведомлений: {hr_chat}\n"
         ),
         inline_keyboard_markup=get_menu_keyboard()
     )
@@ -400,8 +403,12 @@ async def _download_and_parse(bot: Bot, chat_id: str, url: str):
         return
 
     data = load_data()
-    data["vacations"] = rows
-    data["notifications"] = []
+    if not isinstance(data.get("vacations"), dict):
+        data["vacations"] = {}
+    if not isinstance(data.get("notifications"), dict):
+        data["notifications"] = {}
+    data["vacations"][chat_id] = rows
+    data["notifications"][chat_id] = []
     save_data(data)
 
     pending_state[chat_id] = "awaiting_threshold"
@@ -681,12 +688,18 @@ async def notifier_loop(bot: Bot):
 async def send_notifications(bot: Bot):
     """Check vacations and send reminders based on per-chat threshold."""
     data = load_data()
-    vacations = data.get("vacations", [])
+    all_vacations = data.get("vacations", {})
+    all_notifications = data.get("notifications", {})
     settings = data.get("settings", {})
-    notified = set(
-        f"{n['vacation_id']}_{n['chat_id']}"
-        for n in data.get("notifications", [])
-    )
+
+    # Migrate legacy list format on-the-fly
+    if isinstance(all_vacations, list):
+        logger.warning("Migrating legacy vacations list to per-chat dict")
+        all_vacations = {}
+        data["vacations"] = all_vacations
+    if isinstance(all_notifications, list):
+        all_notifications = {}
+        data["notifications"] = all_notifications
 
     today = datetime.now().date()
     sent_count = 0
@@ -699,17 +712,20 @@ async def send_notifications(bot: Bot):
         if not notify_days:
             continue
 
+        vacations = all_vacations.get(chat_id, [])
+        chat_notified = set(
+            f"{n['vacation_id']}_{today}"
+            for n in all_notifications.get(chat_id, [])
+        )
+
         for idx, v in enumerate(vacations):
             try:
                 start_dt = datetime.strptime(v["start_date"], "%Y-%m-%d").date()
                 days_left = (start_dt - today).days
 
-                # Notify when days_left <= notify_days and vacation hasn't started yet
-                # Key includes today's date so re-runs on the same day are idempotent
-                # but a missed day (bot was offline) will still trigger on the next run
                 if 0 <= days_left <= notify_days:
-                    key = f"{idx}_{chat_id}_{today}"
-                    if key not in notified:
+                    key = f"{idx}_{today}"
+                    if key not in chat_notified:
                         msg = (
                             f"⏰ Напоминание об отпуске\n\n"
                             f"👤 {v['fio']}\n"
@@ -721,11 +737,11 @@ async def send_notifications(bot: Bot):
                         )
                         try:
                             bot.send_text(chat_id=chat_id, text=msg)
-                            data["notifications"].append({
+                            all_notifications.setdefault(chat_id, []).append({
                                 "vacation_id": idx,
-                                "chat_id": chat_id,
                                 "sent_at": str(today),
                             })
+                            chat_notified.add(key)
                             sent_count += 1
                         except Exception as e:
                             logger.error(f"Failed to send notification to {chat_id}: {e}")
